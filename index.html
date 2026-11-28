@@ -338,45 +338,149 @@
       document.getElementById('imgInfo').innerHTML = `<strong>${label}</strong><br/><span style="color:#94a3b8; font-size:0.75rem;">Resolution: 512x512 | Format: PNG | Model: SD-v1.5 + LoRA</span>`;
     }
 
-    const sampleImages = ['output_image(1).png', 'output_image(2).png'];
-    let curIdx = 0;
+    function applyModelHint(prompt, modelKey) {
+      if (modelKey === 'lora-v1') return `${prompt}, fine-tuned artwork LoRA style, expressive oil brushstrokes, rich atmospheric lighting`;
+      if (modelKey === 'cyber-lora') return `${prompt}, cyberpunk neo-tokyo LoRA style, neon rim lighting, futuristic illustration`;
+      return prompt;
+    }
 
-    function generateArtwork() {
+    async function callDirectGradio(baseUrl, endpoint, dataPayload, signal) {
+      const initResp = await fetch(`${baseUrl}/gradio_api/call${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: dataPayload }),
+        signal
+      });
+      if (!initResp.ok) throw new Error(`HTTP ${initResp.status}`);
+      const { event_id } = await initResp.json();
+      if (!event_id) throw new Error('Missing event_id');
+      const sseResp = await fetch(`${baseUrl}/gradio_api/call${endpoint}/${event_id}`, { signal });
+      if (!sseResp.ok) throw new Error(`SSE ${sseResp.status}`);
+      const text = await sseResp.text();
+      let lastEvent = '';
+      let lastData = '';
+      for (const line of text.split(/\r?\n/)) {
+        if (line.startsWith('event:')) lastEvent = line.slice(6).trim();
+        else if (line.startsWith('data:')) lastData = line.slice(5).trim();
+      }
+      if (lastEvent === 'complete' && lastData) {
+        const parsed = JSON.parse(lastData);
+        const item = Array.isArray(parsed) ? parsed[0] : null;
+        const url = item && typeof item === 'object' ? item.url : item;
+        if (typeof url === 'string' && url.startsWith('http')) return url;
+      }
+      throw new Error(`Unexpected Gradio event: ${lastEvent}`);
+    }
+
+    async function tryDirectH200Race(prompt, modelKey, steps, seed) {
+      const styled = applyModelHint(prompt, modelKey);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 16000);
+      const zSteps = Math.max(4, Math.min(9, Math.round(steps / 4)));
+      const fluxSteps = Math.max(2, Math.min(8, Math.round(steps / 6)));
+      try {
+        const race = [
+          callDirectGradio('https://mrfakename-z-image-turbo.hf.space', '/generate_image', [styled, 512, 512, zSteps, seed, false], ctrl.signal).then(url => ({ url, engine: 'H200 Z-Image Turbo' })),
+          callDirectGradio('https://black-forest-labs-flux-1-schnell.hf.space', '/infer', [styled, seed, false, 512, 512, fluxSteps], ctrl.signal).then(url => ({ url, engine: 'H200 FLUX.1-schnell' })),
+          callDirectGradio('https://tongyi-mai-z-image-turbo.hf.space', '/generate', [styled, '1024x1024 ( 1:1 )', seed, zSteps, 3.0, false, []], ctrl.signal).then(url => ({ url, engine: 'H200 Tongyi Z-Image' }))
+        ];
+        const res = await Promise.any(race);
+        ctrl.abort();
+        return res;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function synthesizeViaHorde(prompt, modelKey, cfg, steps, seed, statusEl) {
+      const startResp = await fetch('/api/horde/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, model: modelKey, cfg, steps, seed })
+      });
+      const startData = await startResp.json();
+      if (!startResp.ok || !startData.id) throw new Error(startData.error || 'Horde unavailable');
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 2500));
+        const stResp = await fetch(`/api/horde/status/${startData.id}`);
+        const st = await stResp.json();
+        if (st.done && (st.data_url || st.url)) {
+          return { url: st.data_url || st.url, engine: `AI Horde (${st.model || 'SD'})` };
+        }
+        statusEl.innerText = `● Queue #${st.queue_position || 0} (~${st.wait_time || 5}s)...`;
+      }
+      throw new Error('Synthesis timed out');
+    }
+
+    async function generateArtwork() {
+      const prompt = document.getElementById('promptInput').value.trim();
+      if (!prompt) return;
+
       const btn = document.getElementById('genBtn');
       const progCont = document.getElementById('progBarCont');
       const prog = document.getElementById('progBar');
       const status = document.getElementById('renderStatus');
       const steps = parseInt(document.getElementById('stepsRange').value);
-      const seed = document.getElementById('seedInput').value;
-      const cfg = document.getElementById('cfgRange').value;
+      const seed = parseInt(document.getElementById('seedInput').value) || 428190;
+      const cfg = parseFloat(document.getElementById('cfgRange').value);
+      const modelKey = document.getElementById('modelSelect').value;
 
       btn.disabled = true;
-      btn.innerHTML = '⏳ Denoising Latents...';
+      btn.innerHTML = '⏳ Synthesizing Live Diffusion...';
       progCont.style.display = 'block';
       status.style.color = '#eab308';
-      status.innerText = '● Diffusion Step: 1/' + steps;
+      status.innerText = '● Dispatching Latent Synthesis...';
 
-      let step = 0;
-      const interval = setInterval(() => {
-        step++;
-        const pct = Math.round((step / steps) * 100);
+      const t0 = performance.now();
+      let pct = 8;
+      prog.style.width = pct + '%';
+      const ticker = setInterval(() => {
+        pct = Math.min(92, pct + 4);
         prog.style.width = pct + '%';
-        status.innerText = `● Diffusion Step: ${step}/${steps} (${pct}%)`;
+      }, 450);
 
-        if (step >= steps) {
-          clearInterval(interval);
-          btn.disabled = false;
-          btn.innerHTML = '✨ Synthesize Artwork';
+      try {
+        let output = null;
+        try {
+          output = await tryDirectH200Race(prompt, modelKey, steps, seed);
+        } catch (directErr) {
+          status.innerText = '● Switching to Serverless GPU Relay...';
+          const apiResp = await fetch('/api/fast', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, model: modelKey, cfg, steps, seed })
+          });
+          if (apiResp.ok) {
+            const apiData = await apiResp.json();
+            if (apiData.data_url) output = { url: apiData.data_url, engine: apiData.engine };
+          }
+        }
+
+        if (!output) {
+          status.innerText = '● Queuing Community SD Cluster...';
+          output = await synthesizeViaHorde(prompt, modelKey, cfg, steps, seed, status);
+        }
+
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        document.getElementById('mainImage').src = output.url;
+        document.getElementById('imgInfo').innerHTML =
+          `<strong>Live Synthesized Artwork (${output.engine})</strong><br/>` +
+          `<span style="color:#94a3b8; font-size:0.75rem;">Prompt: ${prompt.slice(0, 72)} | Weight: ${modelKey} | Seed: ${seed} | Steps: ${steps} | CFG: ${cfg}</span>`;
+        status.style.color = '#10b981';
+        status.innerText = `● Render Complete (${elapsed}s)`;
+      } catch (err) {
+        status.style.color = '#ef4444';
+        status.innerText = `● Synthesis Failed: ${err.message}`;
+      } finally {
+        clearInterval(ticker);
+        prog.style.width = '100%';
+        setTimeout(() => {
           progCont.style.display = 'none';
           prog.style.width = '0%';
-          status.style.color = '#10b981';
-          status.innerText = '● Render Complete (0.84s)';
-
-          curIdx = (curIdx + 1) % sampleImages.length;
-          document.getElementById('mainImage').src = sampleImages[curIdx];
-          document.getElementById('imgInfo').innerHTML = `<strong>Synthesized Artwork Output</strong><br/><span style="color:#94a3b8; font-size:0.75rem;">Seed: ${seed} | Steps: ${steps} | CFG: ${cfg} | LoRA Scale: 0.85</span>`;
-        }
-      }, 35);
+        }, 300);
+        btn.disabled = false;
+        btn.innerHTML = '✨ Synthesize Artwork';
+      }
     }
   </script>
 </body>
